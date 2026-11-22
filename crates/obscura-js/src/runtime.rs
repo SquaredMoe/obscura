@@ -7510,6 +7510,151 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn worker_request_and_fetch_keep_their_original_page_bindings() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script("worker-original-page-bindings", r#"
+            globalThis.__workerBindings = [];
+            const originalFetch = globalThis.fetch, OriginalRequest = globalThis.Request, OriginalURL = globalThis.URL;
+            globalThis.fetch = async () => ({text:async () => 'original'});
+            const source = `postMessage('ready'); onmessage = async event => {
+                if (event.data === 'fetch') postMessage({fetch:await fetch('https://example.com/value.txt').then(r => r.text())});
+                else {
+                    try { postMessage({protocol:location.protocol,request:new Request('https://example.com/value.txt').url}); }
+                    catch (error) { postMessage({request:error.name}); }
+                }
+            };`;
+            const url = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+            const worker = new Worker(url);
+            worker.onmessage = event => {
+                if (event.data === 'ready') {
+                    globalThis.fetch = async () => ({text:async () => 'replacement'});
+                    worker.postMessage('fetch');
+                } else if ('fetch' in event.data) {
+                    __workerBindings.push(event.data.fetch);
+                    globalThis.Request = null; globalThis.URL = null; worker.postMessage('request');
+                } else {
+                    __workerBindings.push(event.data.request);
+                    __workerBindings.push(event.data.protocol);
+                    globalThis.fetch = originalFetch; globalThis.Request = OriginalRequest; globalThis.URL = OriginalURL;
+                    worker.terminate(); URL.revokeObjectURL(url);
+                }
+            };
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("__workerBindings").unwrap(),
+            serde_json::json!(["original", "https://example.com/value.txt", "blob:"]));
+    }
+
+    #[test]
+    fn worker_url_coercion_precedes_document_base_lookup() {
+        let mut rt = setup_runtime("<html><head><base href='https://example.com/before/'></head><body></body></html>");
+        assert_eq!(rt.evaluate(r#"(() => {
+            let requested;
+            const originalFetch = globalThis.fetch;
+            globalThis.fetch = async url => { requested = url; return {text:async () => ''}; };
+            const worker = new Worker({toString() {
+                document.querySelector('base').setAttribute('href', 'https://example.com/after/');
+                return 'entry.js';
+            }});
+            worker.terminate(); globalThis.fetch = originalFetch;
+            return requested;
+        })()"#).unwrap(), serde_json::json!("https://example.com/after/entry.js"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_urls_use_the_entry_script_without_mutating_the_document() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut bytes = [0u8; 4096];
+                let length = stream.read(&mut bytes).unwrap();
+                let request = String::from_utf8_lossy(&bytes[..length]);
+                let path = request.lines().next().unwrap().split_ascii_whitespace().nth(1).unwrap();
+                let (status, headers, body) = match path {
+                    "/redirect.js" => ("302 Found", "Location: /workers/entry.js\r\n", ""),
+                    "/workers/entry.js" => ("200 OK", "", r#"onmessage = async () => {
+                        const request = new Request('value.txt');
+                        const cloned = request.clone();
+                        const values = await Promise.all([
+                            fetch('value.txt').then(r => r.text()), fetch(request).then(r => r.text())
+                        ]);
+                        const childPath = await new Promise(resolve => {
+                            const child = new Worker('child.js');
+                            child.onmessage = e => { resolve(e.data); child.terminate(); };
+                            child.onerror = () => { resolve('child-error'); child.terminate(); };
+                        });
+                        const changed = Reflect.set(location, 'hash', '#worker-change');
+                        const stableLocation = location === self.location;
+                        const locationReadonly = !Reflect.set(self, 'location', null);
+                        const metadata = [Request, Worker, Request.prototype.clone, fetch, location.toString]
+                            .map(fn => [fn.name, fn.length, Function.prototype.toString.call(fn),
+                                Object.prototype.toString.call(fn), Object.prototype.hasOwnProperty.call(fn, 'prototype')]);
+                        postMessage([location.pathname, new URL(request.url, location.href).pathname,
+                            values, childPath, changed, location.hash, cloned instanceof Request,
+                            Object.prototype.propertyIsEnumerable.call(self, 'Request'),
+                            Object.prototype.propertyIsEnumerable.call(self, 'Worker'), metadata,
+                            stableLocation, locationReadonly]);
+                    };"#),
+                    "/workers/child.js" => ("200 OK", "", "postMessage(location.pathname);"),
+                    "/workers/value.txt" => ("200 OK", "", "worker-value"),
+                    _ => ("200 OK", "", "document-value"),
+                };
+                let response = format!("HTTP/1.1 {status}\r\n{headers}Content-Type: application/javascript\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let url = format!("http://{address}/pages/document.html");
+        let mut rt = ObscuraJsRuntime::with_base_url(&url);
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&url);
+        rt.set_http_client(std::sync::Arc::new(obscura_net::ObscuraHttpClient::with_full_options(
+            std::sync::Arc::new(obscura_net::CookieJar::new()), None, true,
+        )));
+        rt.run_page_init();
+        let result = rt.call_function_on_for_cdp(r#"async () => {
+            const worker = new Worker('/redirect.js');
+            const value = await new Promise(resolve => {
+                worker.onmessage = e => resolve(e.data); worker.postMessage(null);
+            });
+            worker.terminate();
+            const source = `onmessage = async () => {
+                let fetchError, requestError;
+                try { await fetch('value.txt'); } catch (e) { fetchError = e.name; }
+                try { new Request('value.txt'); } catch (e) { requestError = e.name; }
+                postMessage([location.href.startsWith('blob:'), fetchError, requestError]);
+            };`;
+            const blob = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+            const blobWorker = new Worker(blob);
+            const blobValue = await new Promise(resolve => {
+                blobWorker.onmessage = e => resolve(e.data); blobWorker.postMessage(null);
+            });
+            blobWorker.terminate();
+            const normalizedWorker = new Worker('BLOB:' + blob.slice(5));
+            const normalizedValue = await new Promise(resolve => {
+                normalizedWorker.onmessage = e => resolve(e.data); normalizedWorker.postMessage(null);
+            });
+            normalizedWorker.terminate(); URL.revokeObjectURL(blob);
+            return [value, blobValue, normalizedValue, location.pathname, location.hash,
+                await fetch('/pages/value.txt').then(r => r.text())];
+        }"#, None, &[], true, true).await.unwrap();
+        assert_eq!(result.value.unwrap(), serde_json::json!([
+            ["/workers/entry.js", "/workers/value.txt", ["worker-value", "worker-value"],
+             "/workers/child.js", false, "", true, false, false, [
+                 ["Request", 1, "function Request() { [native code] }", "[object Function]", true],
+                 ["Worker", 1, "function Worker() { [native code] }", "[object Function]", true],
+                 ["clone", 0, "function clone() { [native code] }", "[object Function]", false],
+                 ["fetch", 1, "function fetch() { [native code] }", "[object Function]", false],
+                 ["toString", 0, "function toString() { [native code] }", "[object Function]", false]
+             ], true, true],
+            [true, "TypeError", "TypeError"], [true, "TypeError", "TypeError"],
+            "/pages/document.html", "", "document-value"
+        ]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn worker_onmessage_bindings_do_not_mutate_window() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.execute_script("worker-onmessage-bindings", r#"
@@ -20160,6 +20305,94 @@ mod tests {
             .unwrap();
         rt.run_event_loop_bounded(100).await.unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_content_handlers_run_without_reading_image_properties() {
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let loader_requests = requests.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img src="ready.png" onload="document.body.dataset.loaded='yes'">
+               <img src="missing.png" onerror="document.body.dataset.fallback=String(this instanceof HTMLImageElement);this.onerror=null;this.src='ready.png'">
+               <img src="unobserved.png">"#,
+            move |url: &str| {
+                loader_requests.lock().unwrap().push(url.to_string());
+                url.ends_with("ready.png").then(|| png.clone())
+            },
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.dataset.loaded, document.body.dataset.fallback]").unwrap(),
+            serde_json::json!(["yes", "true"]),
+            "HTML content handlers must observe completion before script reads the image",
+        );
+        assert_eq!(
+            rt.evaluate("Array.from(document.images).slice(0,2).map(image => [image.complete,image.naturalWidth,image.naturalHeight])").unwrap(),
+            serde_json::json!([[true, 2, 3], [true, 2, 3]]),
+        );
+        let mut requests = requests.lock().unwrap().clone();
+        requests.sort();
+        assert_eq!(requests, vec![
+            "http://example.com/page/missing.png",
+            "http://example.com/page/ready.png",
+        ], "unobserved images stay lazy and the fallback reuses retained bytes");
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_image_content_handlers_observe_cached_completion() {
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            "<div id='host'></div><img src='ready.png'>",
+            move |url: &str| url.ends_with("ready.png").then(|| png.clone()),
+        );
+        {
+            let mut state = rt.state.borrow_mut();
+            assert!(ensure_prepared_render(&mut state).is_some());
+        }
+        rt.execute_script("insert-image-handlers", r#"
+            document.getElementById('host').innerHTML = `<img src="ready.png" onload="document.body.dataset.cached='loaded'">
+                <img src="missing.png" onerror="document.body.dataset.failed='yes';this.onerror=null;this.src='ready.png'">`;
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("[document.body.dataset.cached,document.body.dataset.failed]").unwrap(),
+            serde_json::json!(["loaded", "yes"]),
+        );
+        assert_eq!(
+            rt.evaluate("Array.from(document.getElementById('host').children).map(image => [image.complete,image.naturalWidth,image.naturalHeight])").unwrap(),
+            serde_json::json!([[true, 2, 3], [true, 2, 3]]),
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn image_content_handler_completion_is_not_replayed_by_late_observers() {
+        let mut rt = parser_image_runtime(
+            r#"<img src="missing.png" onerror="document.body.dataset.errors=(Number(document.body.dataset.errors)||0)+1">"#,
+            move |_url: &str| None,
+        );
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(rt.evaluate("Number(document.body.dataset.errors)").unwrap().as_f64(),
+            Some(1.0));
+        rt.execute_script("late-image-observers", r#"
+            const failed = document.querySelector('img');
+            failed.onerror = () => { document.body.dataset.errors = Number(document.body.dataset.errors)+1; };
+            failed.onload = () => { document.body.dataset.loaded = 'unexpected'; };
+            for (let index = 0; index < 5; index++) {
+                void failed.complete;
+                void failed.naturalWidth;
+                void failed.currentSrc;
+            }
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let result = rt.evaluate("[Number(document.body.dataset.errors),document.body.hasAttribute('data-loaded'),failed.complete,failed.naturalWidth]").unwrap();
+        assert_eq!(result[0].as_f64(), Some(1.0));
+        assert_eq!(result[1], serde_json::json!(false));
+        assert_eq!(result[2], serde_json::json!(true));
+        assert_eq!(result[3].as_f64(), Some(0.0));
     }
 
     #[cfg(feature = "render")]
