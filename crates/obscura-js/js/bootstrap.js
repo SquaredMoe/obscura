@@ -8090,7 +8090,9 @@ function __locationNavigate(url, replace) {
     globalThis.__obscuraNavigateToFragment(target, replace);
     return;
   }
-  globalThis.__virtualUrl = r;
+  // Location keeps describing the current document until the new one
+  // commits (Chrome reads the old URL right after `location.href = x`), so a
+  // navigation that fails never leaves location on a URL that did not load.
   __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId);
 }
 // Location setters (HTML spec): change one component of a copy of the current
@@ -8128,7 +8130,7 @@ globalThis.location = {
   set port(v) { __locationSetPart('port', v); },
   toString() { return this.href; },
   assign(url) { __locationNavigate(url, false); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
+  reload() { var r = _resolveUrl(this.href); __obscuraCore.ops.op_navigate(r, 'GET', '', _realmFrameId); },
   replace(url) { __locationNavigate(url, true); },
 };
 const _locationObj = globalThis.location;
@@ -19757,10 +19759,10 @@ const _installCaretGeometry = (function _installCaretGeometry() {
     _markNative(descriptor.value || descriptor.get);
   }
   _markNative(CaretPosition);
-  function nativeCaret(receiver, x, y) {
+  function nativeCaret(receiver, x, y, rescopeShadow = false) {
     if (receiver !== globalThis.document && !(receiver instanceof Document)) throw new TypeError('Illegal invocation');
     if (receiver._nid !== globalThis.document?._nid) return null;
-    const raw = __obscuraCore.ops.op_layout_caret(x, y, _realmFrameId);
+    const raw = __obscuraCore.ops.op_layout_caret(x, y, _realmFrameId, rescopeShadow);
     if (!raw) return null;
     const [nid, offset] = JSON.parse(raw);
     const node = _wrap(nid);
@@ -19770,7 +19772,8 @@ const _installCaretGeometry = (function _installCaretGeometry() {
     const method = _documentRealmMember(this, 'caretRangeFromPoint');
     if (method) return Reflect.apply(method, this, [x, y]);
     // The legacy Chromium extension takes optional signed integer coordinates.
-    const state = nativeCaret(this, +x | 0, +y | 0);
+    // Rescope before wrapping native hits, including closed shadow descendants.
+    const state = nativeCaret(this, +x | 0, +y | 0, true);
     if (!state) return null;
     const range = new Range();
     // Widget value offsets are not DOM Range boundaries. The legacy API
